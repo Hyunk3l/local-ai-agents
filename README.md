@@ -50,7 +50,7 @@ previous section.
 ## Usage
 
 ```
-python agents/update_dependencies_agent.py /path/to/repo \
+python agents/update_dependencies/main.py /path/to/repo \
   --model llama3 --ollama-url http://127.0.0.1:11434
 ```
 
@@ -61,7 +61,7 @@ python agents/update_dependencies_agent.py /path/to/repo \
 
 ### What happens when you run it
 
-1. **Repository inspection** – `agents/update_dependencies_agent.py` walks the repo
+1. **Repository inspection** – `agents/update_dependencies/main.py` walks the repo
    and identifies package manager files (e.g., `package.json`, `poetry.lock`).
 2. **Plan generation** – LangGraph invokes `ChatOllama` to outline a bespoke plan
    for the detected managers.
@@ -74,7 +74,7 @@ python agents/update_dependencies_agent.py /path/to/repo \
 ### Extending the workflow
 
 - Add new detectors/commands by editing `PACKAGE_PATTERNS` and `build_commands`
-  inside `agents/update_dependencies_agent.py`.
+  inside `agents/update_dependencies/main.py`.
 - If you want additional guardrails (approvals, retries, Git status checks), add
   more nodes to the LangGraph state machine.
 - Integrate shell tools (e.g., `just`, `npx npm-check-updates`) by exposing them
