@@ -1,0 +1,19 @@
+[project]
+name = "local-ai-agents"
+version = "0.1.0"
+description = "Sample LangGraph agent that updates dependencies in a local repo"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "langgraph>=0.1.18",
+  "langchain>=0.2.0",
+  "langchain-ollama>=0.1.0",
+]
+
+[project.optional-dependencies]
+develop = [
+  "uv>=0.1.0",
+]
+
+[tool.uv]
+dev-dependencies = ["ruff"]
