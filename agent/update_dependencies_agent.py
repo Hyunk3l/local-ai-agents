@@ -15,25 +15,151 @@ import argparse
 import json
 import os
 import subprocess
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, TypedDict
+from typing import Callable, Iterable, List, Optional, Sequence, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, StateGraph
 
 
+SKIP_DIRECTORIES = {
+    ".git",
+    "node_modules",
+    "venv",
+    ".venv",
+    "__pycache__",
+    "target",
+    ".gradle",
+}
+
+
 PACKAGE_PATTERNS: tuple[tuple[str, Sequence[str]], ...] = (
-    ("npm", ("package.json",)),
+    ("npm", ("package.json", "package-lock.json", "npm-shrinkwrap.json")),
     ("pnpm", ("pnpm-lock.yaml", "pnpm-workspace.yaml")),
     ("yarn", ("yarn.lock",)),
     ("poetry", ("poetry.lock", "pyproject.toml")),
-    ("pip", ("requirements.txt", "requirements.in")),
+    ("pip", ("requirements.txt", "requirements.in", "setup.py", "setup.cfg")),
+    ("pipenv", ("Pipfile", "Pipfile.lock")),
     ("uv", ("uv.lock",)),
     ("bundler", ("Gemfile", "Gemfile.lock")),
     ("cargo", ("Cargo.toml", "Cargo.lock")),
+    ("gradle", ("build.gradle", "build.gradle.kts", "settings.gradle", "gradlew", "gradlew.bat")),
+    ("maven", ("pom.xml",)),
+    ("go", ("go.mod", "go.sum")),
+    ("dotnet", ("global.json",)),
 )
+
+
+SUFFIX_MATCHERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("dotnet", (".csproj", ".fsproj", ".vbproj", ".sln")),
+)
+
+
+MANAGER_METADATA: dict[str, dict[str, str]] = {
+    "npm": {"label": "npm", "ecosystem": "node"},
+    "pnpm": {"label": "pnpm", "ecosystem": "node"},
+    "yarn": {"label": "yarn", "ecosystem": "node"},
+    "poetry": {"label": "Poetry", "ecosystem": "python"},
+    "pip": {"label": "pip / requirements", "ecosystem": "python"},
+    "pipenv": {"label": "Pipenv", "ecosystem": "python"},
+    "uv": {"label": "uv", "ecosystem": "python"},
+    "bundler": {"label": "Bundler", "ecosystem": "ruby"},
+    "cargo": {"label": "Cargo", "ecosystem": "rust"},
+    "gradle": {"label": "Gradle", "ecosystem": "java/kotlin"},
+    "maven": {"label": "Maven", "ecosystem": "java"},
+    "go": {"label": "Go modules", "ecosystem": "go"},
+    "dotnet": {"label": ".NET", "ecosystem": "dotnet"},
+}
+
+
+def _pip_command(repo_path: Path, _: DetectedManager) -> DependencyUpdateCommand:
+    requirements = repo_path / "requirements.txt"
+    if requirements.exists():
+        args = ["uv", "pip", "install", "--upgrade", "-r", "requirements.txt"]
+        description = "Upgrade pip requirements"
+    else:
+        args = ["uv", "pip", "install", "--upgrade", "."]
+        description = "Upgrade pip-installed project dependencies"
+    return DependencyUpdateCommand(description, args)
+
+
+def _uv_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand("Update uv lockfile", ["uv", "lock", "--upgrade"])
+
+
+def _poetry_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand("Update Poetry dependencies", ["poetry", "update"])
+
+
+def _pipenv_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand("Update Pipenv dependencies", ["pipenv", "update"])
+
+
+def _npm_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand("Update npm packages", ["npm", "update"])
+
+
+def _pnpm_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand("Update pnpm packages", ["pnpm", "update", "--latest"])
+
+
+def _yarn_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand("Update yarn packages", ["yarn", "upgrade", "--latest"])
+
+
+def _bundler_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand("Update Ruby gems", ["bundle", "update"])
+
+
+def _cargo_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand("Update Cargo crates", ["cargo", "update"])
+
+
+def _gradle_command(repo_path: Path, _: DetectedManager) -> DependencyUpdateCommand:
+    wrapper = repo_path / "gradlew"
+    runner = "./gradlew" if wrapper.exists() else "gradle"
+    return DependencyUpdateCommand(
+        "Refresh Gradle dependencies",
+        [runner, "--refresh-dependencies"],
+    )
+
+
+def _maven_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand(
+        "Use latest Maven dependency releases",
+        ["mvn", "versions:use-latest-releases"],
+    )
+
+
+def _go_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand("Update Go modules", ["go", "get", "-u", "./..."])
+
+
+def _dotnet_command(_: Path, __: DetectedManager) -> DependencyUpdateCommand:
+    return DependencyUpdateCommand(
+        "List and upgrade outdated .NET packages",
+        ["dotnet", "list", "package", "--outdated", "--include-transitive"],
+    )
+
+
+COMMAND_BUILDERS: dict[str, CommandBuilder] = {
+    "pip": _pip_command,
+    "uv": _uv_command,
+    "poetry": _poetry_command,
+    "pipenv": _pipenv_command,
+    "npm": _npm_command,
+    "pnpm": _pnpm_command,
+    "yarn": _yarn_command,
+    "bundler": _bundler_command,
+    "cargo": _cargo_command,
+    "gradle": _gradle_command,
+    "maven": _maven_command,
+    "go": _go_command,
+    "dotnet": _dotnet_command,
+}
 
 
 @dataclass
@@ -44,9 +170,21 @@ class DependencyUpdateCommand:
     command: Sequence[str]
 
 
-class AgentState(TypedDict):
+@dataclass
+class DetectedManager:
+    slug: str
+    label: str
+    ecosystem: str
+    evidence: list[str]
+
+
+CommandBuilder = Callable[[Path, DetectedManager], Optional[DependencyUpdateCommand]]
+
+
+class AgentState(TypedDict, total=False):
     repo_path: str
-    detected_managers: List[str]
+    repo_overview: str
+    detected_managers: List[DetectedManager]
     commands: List[DependencyUpdateCommand]
     plan: str
     execution_log: List[str]
@@ -54,87 +192,85 @@ class AgentState(TypedDict):
 
 
 def iter_files(repo_path: Path) -> Iterable[Path]:
-    for root, _, files in os.walk(repo_path):
+    for root, dirs, files in os.walk(repo_path):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRECTORIES]
         for file_name in files:
             yield Path(root) / file_name
 
 
-def detect_package_managers(repo_path: Path) -> list[str]:
-    matches: set[str] = set()
+def describe_repo(repo_path: Path, max_entries: int = 25) -> str:
+    entries: list[str] = []
+    for entry in sorted(repo_path.iterdir(), key=lambda p: p.name.lower()):
+        if entry.name in SKIP_DIRECTORIES or entry.name.startswith("."):
+            continue
+        entries.append(f"{entry.name}{'/' if entry.is_dir() else ''}")
+        if len(entries) >= max_entries:
+            break
+    if not entries:
+        return "Repository appears to be empty"
+    return "\n".join(entries)
+
+
+def detect_package_managers(repo_path: Path) -> list[DetectedManager]:
+    evidence: dict[str, set[str]] = defaultdict(set)
     for file_path in iter_files(repo_path):
+        relative = str(file_path.relative_to(repo_path))
+        file_name = file_path.name
         for manager, patterns in PACKAGE_PATTERNS:
-            if file_path.name in patterns:
-                matches.add(manager)
-    return sorted(matches)
+            if file_name in patterns:
+                evidence[manager].add(relative)
+        for manager, suffixes in SUFFIX_MATCHERS:
+            if file_name.endswith(suffixes):
+                evidence[manager].add(relative)
+
+        if file_name == "pyproject.toml":
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except OSError:
+                content = ""
+            if "[tool.poetry]" in content:
+                evidence["poetry"].add(relative)
+            elif "[project]" in content:
+                evidence["pip"].add(relative)
+
+    detected: list[DetectedManager] = []
+    for slug, paths in sorted(evidence.items()):
+        if slug not in MANAGER_METADATA:
+            continue
+        metadata = MANAGER_METADATA[slug]
+        detected.append(
+            DetectedManager(
+                slug=slug,
+                label=metadata["label"],
+                ecosystem=metadata["ecosystem"],
+                evidence=sorted(paths),
+            )
+        )
+    return detected
 
 
-def build_commands(managers: Sequence[str]) -> list[DependencyUpdateCommand]:
+def build_commands(
+    managers: Sequence[DetectedManager], repo_path: Path
+) -> list[DependencyUpdateCommand]:
     commands: list[DependencyUpdateCommand] = []
     for manager in managers:
-        if manager == "npm":
-            commands.append(
-                DependencyUpdateCommand(
-                    "Update npm packages", ["npm", "update"]
-                )
-            )
-        elif manager == "pnpm":
-            commands.append(
-                DependencyUpdateCommand(
-                    "Update pnpm packages", ["pnpm", "update", "--latest"]
-                )
-            )
-        elif manager == "yarn":
-            commands.append(
-                DependencyUpdateCommand(
-                    "Update yarn packages", ["yarn", "upgrade", "--latest"]
-                )
-            )
-        elif manager == "poetry":
-            commands.append(
-                DependencyUpdateCommand(
-                    "Update Poetry dependencies", ["poetry", "update"]
-                )
-            )
-        elif manager == "pip":
-            commands.append(
-                DependencyUpdateCommand(
-                    "Upgrade requirements via pip", [
-                        "uv",
-                        "pip",
-                        "install",
-                        "--upgrade",
-                        "-r",
-                        "requirements.txt",
-                    ]
-                )
-            )
-        elif manager == "uv":
-            commands.append(
-                DependencyUpdateCommand(
-                    "Update uv.lock dependencies", ["uv", "lock", "--upgrade"]
-                )
-            )
-        elif manager == "bundler":
-            commands.append(
-                DependencyUpdateCommand(
-                    "Update Ruby gems", ["bundle", "update"]
-                )
-            )
-        elif manager == "cargo":
-            commands.append(
-                DependencyUpdateCommand(
-                    "Update Cargo crates", ["cargo", "update"]
-                )
-            )
+        builder = COMMAND_BUILDERS.get(manager.slug)
+        if not builder:
+            continue
+        command = builder(repo_path, manager)
+        if command:
+            commands.append(command)
     return commands
 
 
 def gather_context(state: AgentState) -> AgentState:
     repo_path = Path(state["repo_path"])
+    overview = describe_repo(repo_path)
     managers = detect_package_managers(repo_path)
-    commands = build_commands(managers)
+    commands = build_commands(managers, repo_path)
     return {
         **state,
+        "repo_overview": overview,
         "detected_managers": managers,
         "commands": commands,
         "execution_log": [],
@@ -154,7 +290,15 @@ def plan_updates(state: AgentState, llm: ChatOllama) -> AgentState:
             content=json.dumps(
                 {
                     "repo_path": state["repo_path"],
-                    "detected_managers": state["detected_managers"],
+                    "repo_overview": state.get("repo_overview", ""),
+                    "detected_managers": [
+                        {
+                            "name": manager.label,
+                            "ecosystem": manager.ecosystem,
+                            "evidence": manager.evidence,
+                        }
+                        for manager in state["detected_managers"]
+                    ],
                     "commands": [cmd.description for cmd in state["commands"]],
                 },
                 indent=2,
