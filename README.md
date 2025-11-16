@@ -59,6 +59,24 @@ python agents/update_dependencies/main.py /path/to/repo \
 - `--model` corresponds to any model name served by Ollama.
 - `--ollama-url` defaults to the local Ollama endpoint.
 
+### Summarize a text file with Mastra
+
+The `agents/mastra_file_analyst` project is a standalone TypeScript CLI powered
+by the [Mastra](https://mastra.ai/) framework. It loads a text file, summarizes
+it, and offers a constructive opinion about the contents.
+
+```
+cd agents/mastra_file_analyst
+npm install
+npm run analyze -- path/to/textfile.txt \
+  --model llama3 --ollama-url http://127.0.0.1:11434
+```
+
+- `path/to/textfile.txt` should point to the file you want to analyze.
+- Use `--max-chars` to cap how much of the file is sent to the LLM (defaults to
+  the first 12,000 characters).
+- The CLI relies on `ts-node`, so no build step is required while iterating.
+
 ### What happens when you run it
 
 1. **Repository inspection** – `agents/update_dependencies/main.py` walks the repo
